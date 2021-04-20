@@ -36,6 +36,7 @@ class MLP(nn.Module):
   skip_layer: int = 4  # The layer to add skip layers to.
   num_rgb_channels: int = 3  # The number of RGB channels.
   num_sigma_channels: int = 1  # The number of sigma channels.
+  dtype: Any = jnp.float16 # set mixed precision
 
   @nn.compact
   def __call__(self, x, condition=None):
@@ -59,7 +60,7 @@ class MLP(nn.Module):
     num_samples = x.shape[1]
     x = x.reshape([-1, feature_dim])
     dense_layer = functools.partial(
-        nn.Dense, kernel_init=jax.nn.initializers.glorot_uniform())
+        nn.Dense, kernel_init=jax.nn.initializers.glorot_uniform(dtype=self.dtype))
     inputs = x
     for i in range(self.net_depth):
       x = dense_layer(self.net_width)(x)

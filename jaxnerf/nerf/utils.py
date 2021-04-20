@@ -20,6 +20,8 @@ import os
 from os import path
 from absl import flags
 import flax
+from flax import optim
+
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -35,7 +37,7 @@ INTERNAL = False
 @flax.struct.dataclass
 class TrainState:
   optimizer: flax.optim.Optimizer
-
+  dynamic_scale: optim.DynamicScale
 
 @flax.struct.dataclass
 class Stats:

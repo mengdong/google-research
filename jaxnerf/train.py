@@ -22,8 +22,10 @@ import time
 from absl import app
 from absl import flags
 import flax
+from flax import optim
 from flax.metrics import tensorboard
 from flax.training import checkpoints
+
 import jax
 from jax import config
 from jax import random
@@ -90,8 +92,9 @@ def train_step(model, rng, state, batch, lr):
         loss=loss, psnr=psnr, loss_c=loss_c, psnr_c=psnr_c, weight_l2=weight_l2)
     return loss + loss_c + FLAGS.weight_decay_mult * weight_l2, stats
 
+  dynamic_scale = state.dynamic_scale
   (_, stats), grad = (
-      jax.value_and_grad(loss_fn, has_aux=True)(state.optimizer.target))
+      dynamic_scale.value_and_grad(loss_fn, has_aux=True)(state.optimizer.target))
   grad = jax.lax.pmean(grad, axis_name="batch")
   stats = jax.lax.pmean(stats, axis_name="batch")
 
@@ -132,8 +135,9 @@ def main(unused_argv):
 
   rng, key = random.split(rng)
   model, variables = models.get_model(key, dataset.peek(), FLAGS)
+  dynamic_scale = optim.DynamicScale()
   optimizer = flax.optim.Adam(FLAGS.lr_init).create(variables)
-  state = utils.TrainState(optimizer=optimizer)
+  state = utils.TrainState(optimizer=optimizer, dynamic_scale=dynamic_scale)
   del optimizer, variables
 
   learning_rate_fn = functools.partial(

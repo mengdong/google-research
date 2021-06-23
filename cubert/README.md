@@ -143,6 +143,21 @@ produce output similar to that illustrated in the
 with TensorFlow models, the `decode_list` logic from
 `code_to_subtokenized_sentences.py` can be skipped.
 
+It is possible to configure CuBERT tokenizers to skip emitting tokens of some
+kinds. For our fine-tuning tasks presented below, we skip comment and whitespace
+tokens. After initializing a tokenizer, this will configure it to skip
+those kinds of tokens:
+```
+from cubert import unified_tokenizer
+from cubert import python_tokenizer
+...
+tokenizer = python_tokenizer.PythonTokenizer()
+tokenizer.update_types_to_skip((
+      unified_tokenizer.TokenKind.COMMENT,
+      unified_tokenizer.TokenKind.WHITESPACE,
+  ))
+```
+
 ## The Multi-Headed Pointer Model
 
 The `finetune_varmisuse_pointer_lib.py` file provides an implementation of the
@@ -209,7 +224,7 @@ Here we describe the 6 Python benchmarks we created. All 6 benchmarks were deriv
 
 1. **Function-docstring classification**. Combinations of functions with their correct or incorrect documentation string, used to train a classifier that can tell which pairs go together. The JSON fields are:
      * `function`: string, the source code of a function as text
-     * `docstring`: string, the documentation string for that function
+     * `docstring`: string, the documentation string for that function. Note that the string is unquoted. To be able to properly tokenize it with the CuBERT tokenizers, you have to wrap it in quotes first. For example, in Python, use `string_to_tokenize = f'"""{docstring}"""'`.
      * `label`: string, one of (“Incorrect”, “Correct”), the label of the example.
      * `info`: string, an unformatted description of how the example was constructed, including the source dataset (always “ETHPy150Open”), the repository and filepath, the function name and, for “Incorrect” examples, the function whose docstring was substituted.
 1. **Exception classification**. Combinations of functions where one exception type has been masked, along with a label indicating the masked exception type. The JSON fields are:

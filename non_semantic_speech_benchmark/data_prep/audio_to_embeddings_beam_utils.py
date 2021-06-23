@@ -37,6 +37,7 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 import tensorflow_hub as hub
 from non_semantic_speech_benchmark import file_utils
+from non_semantic_speech_benchmark.export_model import tf_frontend
 
 
 def _tfexample_audio_to_npfloat32(ex, audio_key):
@@ -56,13 +57,30 @@ def _tfexample_audio_to_npfloat32(ex, audio_key):
 
 
 def _samples_to_embedding_tfhub(model_input, sample_rate, mod, output_key):
-  """Run inference to map audio samples to an embedding."""
-  tf_out = mod(
-      tf.constant(model_input, tf.float32), tf.constant(sample_rate, tf.int32))
-  return np.array(tf_out[output_key])
+  """Run inference to map a single audio sample to an embedding."""
+  # Models either take 2 args (input, sample_rate) or 1 arg (input).
+  # The first argument is either 1 dimensional (samples) or 2 dimensional
+  # (batch, samples).
+  # Try all. Order here matters. We must try "2 args" before "1 arg", otherwise
+  # models that use sample rate might ignore it.
+  for num_args, add_batch_dim in [(2, False), (1, False), (2, True), (1, True)]:
+    cur_model_input = (np.expand_dims(model_input, 0) if add_batch_dim
+                       else model_input)
+    func_args = ((cur_model_input,) if num_args == 1 else
+                 (cur_model_input, sample_rate))
+    try:
+      tf_out = mod(*func_args)
+    except ValueError:
+      continue
+    break
+  ret = np.array(tf_out[output_key])
+  if ret.ndim > 2:
+    # Batch-flatten in numpy.
+    ret = np.reshape(ret, [ret.shape[0], -1])
+  return ret
 
 
-def _build_tflite_interpreter(tflite_model_path):
+def build_tflite_interpreter(tflite_model_path):
   model_content = None
   with tf.io.gfile.GFile(tflite_model_path, 'rb') as model_file:
     model_content = model_file.read()
@@ -71,19 +89,31 @@ def _build_tflite_interpreter(tflite_model_path):
   return interpreter
 
 
-def _samples_to_embedding_tflite(model_input, sample_rate, interpreter,
-                                 output_key):
+def _default_feature_fn(samples, sample_rate):
+  frontend_args = tf_frontend.frontend_args_from_flags()
+  feats = tf_frontend.compute_frontend_features(
+      samples, sample_rate, **frontend_args)
+  return tf.expand_dims(feats, axis=-1).numpy().astype(np.float32)
+
+
+def samples_to_embedding_tflite(model_input, sample_rate, interpreter,
+                                output_key):
   """Run TFLite inference to map audio samples to an embedding."""
   input_details = interpreter.get_input_details()
   output_details = interpreter.get_output_details()
   # Resize TFLite input size based on length of sample.
   # Ideally, we should explore if we can use fixed-size input here, and
   # tile the sample to meet TFLite input size.
+  if not np.array_equal(model_input.shape, input_details[0]['shape']):
+    logging.info('TFLite input, actual vs expected: %s vs %s',
+                 model_input.shape, input_details[0]['shape'])
   interpreter.resize_tensor_input(input_details[0]['index'], model_input.shape)
   interpreter.allocate_tensors()
   interpreter.set_tensor(input_details[0]['index'], model_input)
-  interpreter.set_tensor(input_details[1]['index'],
-                         np.array(sample_rate).astype(np.int32))
+  # Models either take 2 args (input, sample_rate) or 1 arg (input). Try both.
+  if len(input_details) > 1:
+    interpreter.set_tensor(input_details[1]['index'],
+                           np.array(sample_rate).astype(np.int32))
 
   interpreter.invoke()
   embedding_2d = interpreter.get_tensor(
@@ -91,7 +121,8 @@ def _samples_to_embedding_tflite(model_input, sample_rate, interpreter,
   return np.array(embedding_2d, dtype=np.float32)
 
 
-@beam.typehints.with_input_types(typing.Tuple[str, typing.Any])
+@beam.typehints.with_input_types(typing.Tuple[typing.Union[bytes, str],
+                                              typing.Any])
 @beam.typehints.with_output_types(typing.Tuple[str, typing.Any])
 class ComputeEmbeddingMapFn(beam.DoFn):
   """Computes an embedding (key, tf.Example) from audio (key, tf.Example)."""
@@ -124,7 +155,7 @@ class ComputeEmbeddingMapFn(beam.DoFn):
 
   def setup(self):
     if self._use_tflite:
-      self.interpreter = _build_tflite_interpreter(self._module)
+      self.interpreter = build_tflite_interpreter(self._module)
     else:
       self.module = hub.load(self._module)
 
@@ -136,6 +167,7 @@ class ComputeEmbeddingMapFn(beam.DoFn):
       raise ValueError(f'Audio key `{self._audio_key}` not found: '
                        f'{list(ex.features.feature.keys())}')
     audio = _tfexample_audio_to_npfloat32(ex, self._audio_key)
+    assert audio.ndim == 1, audio.ndim
     if audio.size == 0:
       raise ValueError(f'No audio found: {self._audio_key}, {audio.size} {k}')
     beam.metrics.Metrics.distribution(
@@ -178,15 +210,17 @@ class ComputeEmbeddingMapFn(beam.DoFn):
         raise ValueError(f'Should be float32, was: {model_input.dtype}')
     else:
       model_input = audio
+      if self._use_tflite:
+        model_input = np.expand_dims(model_input, axis=0)
     logging.info('`model_input` shape is: %s', model_input.shape)
 
     # Calculate the 2D embedding.
     if self._use_tflite:
-      embedding_2d = _samples_to_embedding_tflite(
-          audio, sample_rate, self.interpreter, self._output_key)
+      embedding_2d = samples_to_embedding_tflite(
+          model_input, sample_rate, self.interpreter, self._output_key)
     else:
-      embedding_2d = _samples_to_embedding_tfhub(model_input, sample_rate,
-                                                 self.module, self._output_key)
+      embedding_2d = _samples_to_embedding_tfhub(
+          model_input, sample_rate, self.module, self._output_key)
     assert isinstance(embedding_2d, np.ndarray)
     assert embedding_2d.ndim == 2
     assert embedding_2d.dtype == np.float32
@@ -387,11 +421,25 @@ writer_functions = {
 
 
 def make_beam_pipeline(
-    root, input_filenames, sample_rate, debug, embedding_names,
-    embedding_modules, module_output_keys, audio_key, sample_rate_key,
-    label_key, speaker_id_key, average_over_time, delete_audio_from_output,
-    output_filename, split_embeddings_into_separate_tables=False,
-    input_format='tfrecord', output_format='tfrecord', suffix='Main'):
+    root,
+    input_filenames,
+    sample_rate,
+    debug,
+    embedding_names,
+    embedding_modules,
+    module_output_keys,
+    audio_key,
+    sample_rate_key,
+    label_key,
+    speaker_id_key,
+    average_over_time,
+    delete_audio_from_output,
+    output_filename,
+    split_embeddings_into_separate_tables=False,
+    use_frontend_fn=False,
+    input_format='tfrecord',
+    output_format='tfrecord',
+    suffix='Main'):
   """Construct beam pipeline for mapping from audio to embeddings.
 
   Args:
@@ -414,6 +462,8 @@ def make_beam_pipeline(
     output_filename: Python string. Output filename.
     split_embeddings_into_separate_tables: Python bool. If true, write each
       embedding to a separate table.
+    use_frontend_fn: If `true`, call frontend fn on audio before passing to the
+      model.
     input_format: Python string. Must correspond to a function in
       `reader_functions`.
     output_format: Python string. Must correspond to a function
@@ -448,7 +498,8 @@ def make_beam_pipeline(
             audio_key=audio_key,
             sample_rate_key=sample_rate_key,
             sample_rate=sample_rate,
-            average_over_time=average_over_time))
+            average_over_time=average_over_time,
+            feature_fn=_default_feature_fn if use_frontend_fn else None))
     embedding_tables[name] = tbl
   assert tf_examples_key_ not in embedding_tables
   embedding_tables[tf_examples_key_] = input_examples

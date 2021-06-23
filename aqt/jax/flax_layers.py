@@ -30,6 +30,7 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 
+from aqt.jax import compute_cost_utils
 from aqt.jax import get_bounds
 from aqt.jax import quant_config
 from aqt.jax import quantization
@@ -39,7 +40,6 @@ from aqt.jax import utils
 from aqt.jax.flax import struct as flax_struct
 from aqt.jax.quantization import QuantOps
 from aqt.jax.quantization import QuantType
-
 
 FLAGS = flags.FLAGS
 
@@ -83,6 +83,8 @@ class DenseAqt(nn.Module):
     # Target integer precision of weights in bits.
     # If None, no weight quantization will be applied.
     weight_prec: Union[None, int, QuantOps.FloatQuant]
+    # half_shift flag for weights
+    weight_half_shift: bool
     # QuantOps hyperparameter to quantize inputs. If None, no activation
     # quantization will be applied.
     quant_act: Optional[QuantOps.ActHParams]
@@ -173,6 +175,7 @@ class DenseAqt(nn.Module):
 
     weight_params = QuantOps.WeightParams(
         prec=hparams.weight_prec,
+        half_shift=hparams.weight_half_shift,
         axis=weight_quant_axis,
         expected_scale_shape=expected_scale_shape)
 
@@ -236,6 +239,8 @@ class ConvAqt(nn.Module):
     # Target integer precision of weights in bits.
     # If None, no weight quantization will be applied.
     weight_prec: Union[None, int, QuantOps.FloatQuant]
+    # half_shift flag for weights
+    weight_half_shift: bool
     # QuantOps hyperparameter to quantize inputs. If None, no activation
     # quantization will be applied.
     quant_act: Optional[QuantOps.ActHParams]
@@ -311,6 +316,7 @@ class ConvAqt(nn.Module):
           kernel,
           weight_params=QuantOps.WeightParams(
               prec=hparams.weight_prec,
+              half_shift=hparams.weight_half_shift,
               axis=kernel_reduction_axis,
               expected_scale_shape=expected_scale_shape),
           quantized_type=quantized_type)
@@ -318,6 +324,12 @@ class ConvAqt(nn.Module):
     # Convolution
     dimension_numbers = flax.nn.linear._conv_dimension_numbers(inputs.shape)  # pylint: disable=protected-access
     metadata_context = contextlib.suppress()
+    # Use metadata context to annotate op metadata with quantization info
+    act_prec = None if hparams.quant_act is None else hparams.quant_act.prec
+
+    if flags.FLAGS.metadata_enabled:
+      metadata_context = compute_cost_utils.ConvMetadataMonkeyPatch(
+          weight_prec=hparams.weight_prec, act_prec=act_prec)
     with metadata_context:
       y = lax.conv_general_dilated(
           inputs,
@@ -370,10 +382,12 @@ class EmbedAqt(nn.Module):
   """
 
   @dataclass
-  class HParams:
+  class HParams:  # pylint: disable=missing-docstring
     # Target integer precision of weights in bits.
     # If None, no quantization will be applied.
     weight_prec: Union[None, int, QuantOps.FloatQuant]
+    # half_shift flag for weights
+    weight_half_shift: bool
     # QuantOps hyperparameter to quantize inputs for logits. If None, no
     # activation quantization will be applied.
     quant_act: Optional[QuantOps.ActHParams]
@@ -407,7 +421,8 @@ class EmbedAqt(nn.Module):
         weight_params=QuantOps.WeightParams(
             prec=hparams.weight_prec,
             axis=(0,),
-            expected_scale_shape=(1, self.embedding.shape[0])))
+            expected_scale_shape=(1, self.embedding.shape[0]),
+            half_shift=hparams.weight_half_shift))
 
   def __call__(
       self,
@@ -441,6 +456,7 @@ class EmbedAqt(nn.Module):
       )
 
     weight_prec = hparams.weight_prec
+    weight_half_shift = hparams.weight_half_shift
     if weight_prec is not None:
       quantized_type = hparams.quant_type.to_jax_type()
       # In contrast to all other scale factor calculations in this module, we
@@ -453,7 +469,8 @@ class EmbedAqt(nn.Module):
       # weight matrix in the logits layer, which is what we need for AQT.
       embedding_quant_ops = QuantOps.create_weights_ops(
           embedding,
-          weight_params=QuantOps.WeightParams(prec=weight_prec, axis=(1,)))
+          weight_params=QuantOps.WeightParams(
+              prec=weight_prec, axis=(1,), half_shift=weight_half_shift))
       embedding_quant_ops.assert_scale_shape_is(shape=(self.num_embeddings, 1))
 
       quantized_embedding = embedding_quant_ops.to_quantized(
@@ -616,10 +633,27 @@ class LayerNormAqt(nn.Module):
       def to_quantized(x):
         return quant_ops.to_quantized(x, dtype=dtype)
 
+      # If epsilon is too small to represent in the quantized format, we set it
+      # to the minimal representative non-zero value to avoid the possibility of
+      # dividing by zero.
+      fp_bounds = quantization.fp_cast.get_bounds(prec.exp_min, prec.exp_max,
+                                                  prec.sig_bits)
+      epsilon = max(self.epsilon, fp_bounds.flush_to_zero_bound)
+      quantized_epsilon = to_quantized(jnp.array(epsilon, dtype=dtype))
+
+      # If the reciprocal of the quantized number of features is too small to
+      # represent in the quantized format, we set it to the minimal
+      # representative nonzero value so that the mean and variance are not
+      # trivially 0.
       num_features_quantized = to_quantized(
           jnp.array(num_features, dtype=dtype))
       num_features_recip_quantized = to_quantized(
           jnp.reciprocal(num_features_quantized))
+      num_features_recip_quantized = jax.lax.cond(
+          jax.lax.eq(num_features_recip_quantized,
+                     0.0), lambda _: quantized_epsilon,
+          lambda _: num_features_recip_quantized, None)
+
       x_quantized = to_quantized(x)
       x_sum_quantized_reduction = quantization.quantized_sum(
           x_quantized,
@@ -637,14 +671,7 @@ class LayerNormAqt(nn.Module):
           prec=hparams.quant_hparams.reduction_prec)
       x_sq_sum = to_quantized(x_sq_sum_quantized_reduction)
       var = to_quantized(x_sq_sum * num_features_recip_quantized)
-      # If epsilon is too small to represent in the quantized format, we set it
-      # to the minimal representative non-zero value to avoid the possibility of
-      # dividing by zero.
-      fp_bounds = quantization.fp_cast.get_bounds(prec.exp_min, prec.exp_max,
-                                                  prec.sig_bits)
-      epsilon = max(self.epsilon, fp_bounds.flush_to_zero_bound)
-      quantized_epsilon = to_quantized(jnp.array(epsilon, dtype=dtype))
-
+      # Prevent division by zero.
       var_plus_epsilon = to_quantized(var + quantized_epsilon)
       mul = to_quantized(lax.rsqrt(var_plus_epsilon))
       if self.use_scale:

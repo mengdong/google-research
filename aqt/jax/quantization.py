@@ -29,13 +29,13 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 
-from aqt import fp_cast
+from aqt.jax import compute_cost_utils
+from aqt.jax import fp_cast
 from aqt.jax import get_bounds
 from aqt.jax import primitives
 from aqt.jax import shape_utils
 from aqt.jax import utils
 from aqt.jax.flax import struct as flax_struct
-
 
 # Global bool to control the use of epsilon in the denominator of the scaling
 # methods signed_int_scale and unsigned_int_scale. Epsilon is added to avoid
@@ -148,6 +148,8 @@ class QuantOps:
   class WeightParams:
     """Parameters for weight quantization."""
     prec: _PrecT  # expected precision for weight quantization.
+    # enable all available values during quantization
+    half_shift: bool
     # Axis along which to quantize weights (the non-feature axis).
     axis: Optional[Iterable[int]]
     # expected scale shape for weights quantization. Defaults to None.
@@ -167,9 +169,13 @@ class QuantOps:
     # float means fixed bound. '-1' means no quantization.
     bounds: ActsBoundT
     prec: _PrecT
+    half_shift: bool
 
-  def __init__(self, *, prec, scale,
-               symmetric, bounds):
+  def __init__(self,  #
+               *,
+               prec,
+               scale, symmetric,
+               bounds, half_shift):
     """Default constructor, use of named constructors is strongly encoraged.
 
     Args:
@@ -177,8 +183,10 @@ class QuantOps:
       scale: scaling factor to scale the input to quantized precision range
       symmetric: whether the input to quantize is symmetric
       bounds: Optional. The clipping bounds used for calculating scale factors.
+      half_shift: Symmetric quantization with all available values enabled
     """
     self._prec = prec
+    self._half_shift = half_shift
     if scale is None:
       self._scale = None
     else:
@@ -212,7 +220,12 @@ class QuantOps:
       if fp_quant.is_scaled:
         raise ValueError(
             'bounds can only be None if fp_quant.is_scaled is False.')
-      return cls(prec=fp_quant, scale=None, symmetric=True, bounds=None)
+      return cls(
+          prec=fp_quant,
+          scale=None,
+          symmetric=True,
+          bounds=None,
+          half_shift=False)  # disable half_shift for fp quantization
     else:
       initial_bounds = bounds
       bounds = jnp.asarray(bounds, SCALE_DTYPE)
@@ -225,16 +238,21 @@ class QuantOps:
       scale = lax.stop_gradient(scale)
 
       return cls(
-          prec=fp_quant, scale=scale, symmetric=True, bounds=initial_bounds)
+          prec=fp_quant,
+          scale=scale,
+          symmetric=True,
+          bounds=initial_bounds,
+          half_shift=False)  # disable half_shift for fp quantization
 
   @classmethod
-  def create_symmetric(cls, *, bounds,
-                       prec):
+  def create_symmetric(cls, *, bounds, prec,
+                       half_shift):
     """Create QuantOps for symmetric activations clipped to [-bounds, bounds].
 
     Args:
       bounds: The upper (and absolute lower) bound to clip the inputs.
       prec: Signed int precision for the QuantOps.
+      half_shift: Symmetric quantization with all available values enabled
 
     Returns:
       QuantOps for quantizing/dequantizing signed activations.
@@ -248,7 +266,12 @@ class QuantOps:
     # when scale is not a constant, but computed as a function of activations or
     # weights.
     scale = lax.stop_gradient(scale)
-    return cls(prec=prec, scale=scale, symmetric=True, bounds=initial_bounds)
+    return cls(
+        prec=prec,
+        scale=scale,
+        symmetric=True,
+        bounds=initial_bounds,
+        half_shift=half_shift)
 
   @classmethod
   def create_positive(cls, *, bounds,
@@ -270,7 +293,12 @@ class QuantOps:
     # NOTE: stop_gradient is needed here to prevent gradient flow through scale
     # when scale is not a constant, but computed as a function of activations.
     scale = lax.stop_gradient(scale)
-    return cls(prec=prec, scale=scale, symmetric=False, bounds=initial_bounds)
+    return cls(
+        prec=prec,
+        scale=scale,
+        symmetric=False,
+        bounds=initial_bounds,
+        half_shift=False)  # disable half_shift for positive distribution
 
   def assert_scale_shape_is(self, *, shape):
     # TODO(shivaniagrawal): add option for float scale for fixed bound acts
@@ -314,7 +342,8 @@ class QuantOps:
       else:
         quantize = primitives.floor_and_clip_to_unsigned_int
       scaled_x = jnp.multiply(x, self._scale)
-      return quantize(scaled_x, prec=self._prec, dtype=dtype)
+      return quantize(
+          scaled_x, prec=self._prec, dtype=dtype, half_shift=self._half_shift)
 
   # Same as to_quantized but it just "downscales" using the same scale.
   def from_quantized(self, x, *,
@@ -365,10 +394,12 @@ class QuantOps:
     """
     weight_bounds = primitives.max_abs_weights(w, axis=weight_params.axis)
     prec = weight_params.prec
+    half_shift = weight_params.half_shift
     if isinstance(prec, _FloatQuant):
       ops = cls.create_symmetric_fp(bounds=weight_bounds, fp_quant=prec)
     else:
-      ops = cls.create_symmetric(bounds=weight_bounds, prec=prec)
+      ops = cls.create_symmetric(
+          bounds=weight_bounds, prec=prec, half_shift=half_shift)
     if weight_params.expected_scale_shape is not None:
       # NOTE: We set keepdim to True when computing weights scale, as a result
       # the axes which are reduced are left in the result as dimensions with
@@ -467,7 +498,8 @@ class QuantOps:
     if isinstance(hparams.prec, _FloatQuant):
       ops = cls.create_symmetric_fp(bounds=clip_bounds, fp_quant=hparams.prec)
     elif hparams.input_distribution == cls.ActHParams.InputDistribution.symmetric:
-      ops = cls.create_symmetric(bounds=clip_bounds, prec=hparams.prec)
+      ops = cls.create_symmetric(
+          bounds=clip_bounds, prec=hparams.prec, half_shift=hparams.half_shift)
     elif hparams.input_distribution == cls.ActHParams.InputDistribution.positive:
       ops = cls.create_positive(bounds=clip_bounds, prec=hparams.prec)
     else:
@@ -635,7 +667,7 @@ def quantized_dot(*,
   dot_dimension_numbers = (((act.ndim - 1,), (0,)), ((), ()))
   if quant_type == QuantType.aqt:
     # Let 's' be activation scales and 't' be weight scales. We implement
-    # matmul(RoundAndClip(w*s), RoundAndClip(s^-1 * w * t)) *t^-1. In the
+    # matmul(RoundAndClip(act*s), RoundAndClip(s^-1 * w * t)) *t^-1. In the
     # comments below, we refer to this terminology.
     # lax.dot accepts any combination of 1d and 2d arguments for its lhs and rhs
     # input. To simplify the AQT implementation, we only accept 2d arguments for
@@ -743,23 +775,37 @@ def quantized_dot(*,
       weight_scale = jnp.array(1.0, dtype=SCALE_DTYPE)
 
     # Use metadata context to annotate op metadata with quantization info
-    lhs_prec = None if act_hparams is None else act_hparams.prec
-    rhs_prec = None if weight_params is None else weight_params.prec
+    act_prec = None if act_hparams is None else act_hparams.prec
+    act_has_symm_distribution = act_hparams is not None and (
+        act_hparams.input_distribution
+        == QuantOps.ActHParams.InputDistribution.symmetric)
+    weight_prec = None if weight_params is None else weight_params.prec
 
     # To decide whether to use an integer-domain dot operation, we first check
     # if the static quantization parameters are compatible with it by seeing if
     # they request that both inputs be quantized 8bits or less. Then check if
     # the dynamic parameters are compatible with it. ie, in a training run with
     # quantization enabled, are we past the activation start step yet.
-    if lhs_prec is None or rhs_prec is None or lhs_prec > 8 or rhs_prec > 8:
-      use_int8_to_int32_dot = False
-    else:
-      # is_act_quantized might be an instance of a Jax tracer instead of a
-      # Python boolean since it is generally computed from a dynamic input to a
-      # JITted Jax function. Thus we use '&' instead of 'and'.
-      use_int8_to_int32_dot = prefer_int8_to_int32_dot & is_weight_quantized & is_act_quantized
+
+    # We also do not use int8_to_int32_dot if activation has positive
+    # distribution and prec=8, since we would not be able to fit uint8 range in
+    # int8.
+    # TODO(shivaniagrawal): A proper solution for this would be to have mixed
+    # dot(uint8, int8) -> int32 in XLA.
+    weight_fits_in_int8 = is_weight_quantized and (weight_prec is not None and
+                                                   weight_prec <= 8)
+    # is_act_quantized might be an instance of a Jax tracer instead of a
+    # Python boolean since it is generally computed from a dynamic input to a
+    # JITted Jax function. Thus we use '&' instead of 'and'.
+    act_prec_fits_int8 = act_prec is not None and (
+        (act_prec == 8 and act_has_symm_distribution) or (act_prec < 8))
+    act_fits_in_int8 = is_act_quantized & act_prec_fits_int8
+    use_int8_to_int32_dot = prefer_int8_to_int32_dot & weight_fits_in_int8 & act_fits_in_int8
 
     metadata_context = contextlib.suppress()
+    if flags.FLAGS.metadata_enabled:
+      metadata_context = compute_cost_utils.DotMetadataMonkeyPatch(
+          lhs_prec=act_prec, rhs_prec=weight_prec, rhs_is_weight=True)
     with metadata_context:
       # Calculate matmul(...)
       out_quantized = dot_general_aqt(
@@ -804,6 +850,13 @@ def quantized_dot(*,
           act, hparams=act_hparams, get_bounds_params=get_bounds_params)
 
     metadata_context = contextlib.suppress()
+    # Use metadata context to annotate op metadata with quantization info
+    act_prec = None if act_hparams is None else act_hparams.prec
+    weight_prec = None if weight_params is None else weight_params.prec
+
+    if flags.FLAGS.metadata_enabled:
+      metadata_context = compute_cost_utils.DotMetadataMonkeyPatch(
+          lhs_prec=act_prec, rhs_prec=weight_prec, rhs_is_weight=True)
     with metadata_context:
       out_quantized = lax.dot_general(
           act,
@@ -943,6 +996,13 @@ def quantized_dynamic_dot_general(
         rhs_act, rhs_act_hparams, rhs_get_bounds_params)
 
     metadata_context = contextlib.suppress()
+    # Use metadata context to annotate op metadata with quantization info
+    lhs_prec = None if lhs_act_hparams is None else lhs_act_hparams.prec
+    rhs_prec = None if rhs_act_hparams is None else rhs_act_hparams.prec
+
+    if flags.FLAGS.metadata_enabled:
+      metadata_context = compute_cost_utils.DotMetadataMonkeyPatch(
+          lhs_prec=lhs_prec, rhs_prec=rhs_prec, rhs_is_weight=False)
     with metadata_context:
       out_quantized = lax.dot_general(
           lhs_quantized,
@@ -974,6 +1034,13 @@ def quantized_dynamic_dot_general(
           get_bounds_params=rhs_get_bounds_params)
 
     metadata_context = contextlib.suppress()
+    # Use metadata context to annotate op metadata with quantization info
+    lhs_prec = None if lhs_act_hparams is None else lhs_act_hparams.prec
+    rhs_prec = None if rhs_act_hparams is None else rhs_act_hparams.prec
+
+    if flags.FLAGS.metadata_enabled:
+      metadata_context = compute_cost_utils.DotMetadataMonkeyPatch(
+          lhs_prec=lhs_prec, rhs_prec=rhs_prec, rhs_is_weight=False)
     with metadata_context:
       out = lax.dot_general(
           lhs_act,

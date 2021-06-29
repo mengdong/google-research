@@ -93,8 +93,8 @@ def train_step(model, rng, state, batch, lr):
     return loss + loss_c + FLAGS.weight_decay_mult * weight_l2, stats
 
   dynamic_scale = state.dynamic_scale
-  (_, stats), grad = (
-      dynamic_scale.value_and_grad(loss_fn, has_aux=True)(state.optimizer.target))
+  dynamic_scale, is_fin, (_, stats), grad = (
+    dynamic_scale.value_and_grad(loss_fn, has_aux=True)(state.optimizer.target))
   grad = jax.lax.pmean(grad, axis_name="batch")
   stats = jax.lax.pmean(stats, axis_name="batch")
 

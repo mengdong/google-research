@@ -178,8 +178,8 @@ class Dataset(threading.Thread):
     """Generating rays for all images."""
     pixel_center = 0.5 if self.use_pixel_centers else 0.0
     x, y = np.meshgrid(  # pylint: disable=unbalanced-tuple-unpacking
-        np.arange(self.w, dtype=np.float32) + pixel_center,  # X-Axis (columns)
-        np.arange(self.h, dtype=np.float32) + pixel_center,  # Y-Axis (rows)
+        np.arange(self.w, dtype=np.float16) + pixel_center,  # X-Axis (columns)
+        np.arange(self.h, dtype=np.float16) + pixel_center,  # Y-Axis (rows)
         indexing="xy")
     camera_dirs = np.stack([(x - self.w * 0.5) / self.focal,
                             -(y - self.h * 0.5) / self.focal, -np.ones_like(x)],
@@ -210,7 +210,7 @@ class Blender(Dataset):
       frame = meta["frames"][i]
       fname = os.path.join(args.data_dir, frame["file_path"] + ".png")
       with utils.open_file(fname, "rb") as imgin:
-        image = np.array(Image.open(imgin), dtype=np.float32) / 255.
+        image = np.array(Image.open(imgin), dtype=np.float16) / 255.
         if args.factor == 2:
           [halfres_h, halfres_w] = [hw // 2 for hw in image.shape[:2]]
           image = cv2.resize(
@@ -218,7 +218,7 @@ class Blender(Dataset):
         elif args.factor > 0:
           raise ValueError("Blender dataset only supports factor=0 or 2, {} "
                            "set.".format(args.factor))
-      cams.append(np.array(frame["transform_matrix"], dtype=np.float32))
+      cams.append(np.array(frame["transform_matrix"], dtype=np.float16))
       images.append(image)
     self.images = np.stack(images, axis=0)
     if args.white_bkgd:
@@ -258,7 +258,7 @@ class LLFF(Dataset):
     images = []
     for imgfile in imgfiles:
       with utils.open_file(imgfile, "rb") as imgin:
-        image = np.array(Image.open(imgin), dtype=np.float32) / 255.
+        image = np.array(Image.open(imgin), dtype=np.float16) / 255.
         images.append(image)
     images = np.stack(images, axis=-1)
 
@@ -279,9 +279,9 @@ class LLFF(Dataset):
     # Correct rotation matrix ordering and move variable dim to axis 0.
     poses = np.concatenate(
         [poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
-    poses = np.moveaxis(poses, -1, 0).astype(np.float32)
+    poses = np.moveaxis(poses, -1, 0).astype(np.float16)
     images = np.moveaxis(images, -1, 0)
-    bds = np.moveaxis(bds, -1, 0).astype(np.float32)
+    bds = np.moveaxis(bds, -1, 0).astype(np.float16)
 
     # Rescale according to a default bd factor.
     scale = 1. / (bds.min() * .75)
@@ -408,7 +408,7 @@ class LLFF(Dataset):
           [np.cos(theta), -np.sin(theta), -np.sin(theta * zrate), 1.]) * rads))
       z = self._normalize(c - np.dot(c2w[:3, :4], np.array([0, 0, -focal, 1.])))
       render_poses.append(np.concatenate([self._viewmatrix(z, up, c), hwf], 1))
-    self.render_poses = np.array(render_poses).astype(np.float32)[:, :3, :4]
+    self.render_poses = np.array(render_poses).astype(np.float16)[:, :3, :4]
 
   def _generate_spherical_poses(self, poses, bds):
     """Generate a 360 degree spherical path for rendering."""

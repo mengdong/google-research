@@ -245,7 +245,7 @@ def piecewise_constant_pdf(key, bins, weights, num_samples, randomized):
     u = random.uniform(key, list(cdf.shape[:-1]) + [num_samples])
   else:
     # Match the behavior of random.uniform() by spanning [0, 1-eps].
-    u = jnp.linspace(0., 1. - jnp.finfo('float32').eps, num_samples)
+    u = jnp.linspace(0., 1. - jnp.finfo('float16').eps, num_samples)
     u = jnp.broadcast_to(u, list(cdf.shape[:-1]) + [num_samples])
 
   # Identify the location in `cdf` that corresponds to a random sample.
